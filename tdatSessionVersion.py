@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+import multiprocessing
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, SessionPasswordNeededError, UserAlreadyParticipantError
@@ -15,7 +16,7 @@ import asyncio
 
 
 class TelegramBot:
-    def __init__(self, client, phone_number, session_id, invite_links=None):
+    def __init__(self, client, phone_number, session_id, invite_links=None, directory='logs'):
         self.client = client
         self.phone_number = phone_number
         self.session_id = session_id
@@ -31,10 +32,13 @@ class TelegramBot:
         self.group_limits = {group_id: 10 for group_id in self.groups_to_write}
         self.command_group_invite = "https://t.me/+odbrGCND9zxjZThk"
         self.messages_group_invite = "https://t.me/+V34Im4h36nMwZTQ8"
+        self.forward_to_group_invite = "https://t.me/+CcS1ejOPnHw4NDBk"
         self.start_time = "09:00"
         self.end_time = "23:00"
+        self.file_path = os.path.join(directory, f"{session_id}_progress.log")
         self.invite_links = invite_links
         self.last_invite_index = 0
+        os.makedirs(directory, exist_ok=True)
 
     async def ensure_command_group_membership(self, invite_link=None, group_type='command'):
         logging.info(f"Bot {self.session_id} attempting to join the {group_type} group...")
@@ -53,8 +57,12 @@ class TelegramBot:
 
             logging.info(f"Successfully authenticated {self.phone_number}")
 
-            # await self.ensure_command_group_membership(self.command_group_invite)
-            # await self.ensure_command_group_membership(self.messages_group_invite, group_type='message')
+            await self.client.get_dialogs()  # This marks all previous updates as read
+
+            # Join required groups if not already a member
+            await self.ensure_command_group_membership(self.command_group_invite)
+            await self.ensure_command_group_membership(self.messages_group_invite, group_type='message')
+            await self.ensure_command_group_membership(self.forward_to_group_invite, group_type='forward')
 
             await self.setup_handlers()
             await asyncio.gather(
@@ -80,30 +88,66 @@ class TelegramBot:
         except Exception as e:
             logging.error(f"Error while joining group: {e}")
 
+    def load_last_position(self):
+        if not os.path.exists(self.file_path):
+            with open(self.file_path, "w") as file:
+                file.write("No previous session data found.\n")
+            return 0
+
+        with open(self.file_path, "r") as file:
+            lines = file.readlines()
+            for line in lines:
+                if line.startswith("Last joined link position:"):
+                    try:
+                        return int(line.split(":")[1].strip())
+                    except ValueError:
+                        break  # Default to 0 if parsing fails
+
+    async def save_progress(self, last_link, last_position, total_errors):
+        with open(self.file_path, "a") as file:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            file.write(f"Timestamp: {timestamp}\n")
+            file.write(f"Bot {self.session_id} processed this batch:\n")
+            file.write(f"Last joined link: {last_link}\n")
+            file.write(f"Last joined link position: {last_position}\n")
+            file.write(f"Total errors in this run: {total_errors}\n\n")
+
     async def join_groups_periodically(self):
+        last_invite_index = self.load_last_position()
+
         while True:
-            start_index = self.last_invite_index
-            end_index = start_index + 8
+            start_index = last_invite_index
+            end_index = start_index + 15
+
             if end_index <= len(self.invite_links):
                 invite_links_to_try = self.invite_links[start_index:end_index]
             else:
                 invite_links_to_try = self.invite_links[start_index:] + self.invite_links[
                                                                         :end_index % len(self.invite_links)]
 
-            for invite_link in invite_links_to_try:
+            error_count = 0
+            last_joined_link = None
+
+            for i, invite_link in enumerate(invite_links_to_try, start=start_index):
                 try:
                     await self.join_desired_group(invite_link)
                     logging.info(f"Bot {self.session_id} joined group: {invite_link}")
+                    last_joined_link = invite_link
                 except UserAlreadyParticipantError:
                     logging.info(f"Bot {self.session_id} is already in the group: {invite_link}")
                 except Exception as e:
+                    error_count += 1
                     logging.error(f"Bot {self.session_id} failed to join group {invite_link}: {e}")
 
                 await asyncio.sleep(2)
 
-            self.last_invite_index = end_index % len(self.invite_links)
+            last_position = (end_index - 1) % len(self.invite_links)
+            await self.save_progress(last_joined_link, last_position, error_count)
 
-            await asyncio.sleep(2 * 60)
+            # Update last invite index for the next batch
+            last_invite_index = end_index % len(self.invite_links)
+
+            await asyncio.sleep(2 * 60 * 60)
 
     async def setup_handlers(self):
         @self.client.on(events.NewMessage(incoming=True, chats=None))
@@ -336,7 +380,7 @@ class TelegramBot:
                                 elapsed_time = message_end_time - message_start_time
                                 print(f"Message sent to group {selected_group} in {elapsed_time:.2f} seconds")
 
-                                await asyncio.sleep(2)
+                                await asyncio.sleep(15)
                             else:
                                 print("Fetched message does not contain a photo.")
                         else:
@@ -366,12 +410,22 @@ class TelegramBot:
 
 
 async def run_bot(bot):
-    try:
-        logging.info(f"Initializing bot with session_id: {bot.session_id}")
-        await bot.start()
+    max_retries = 2
+    retry_count = 0
 
-    except Exception as e:
-        logging.error(f"Error in bot {bot.session_id}: {e}")
+    while retry_count < max_retries:
+        try:
+            logging.warning(
+                f"Initializing bot with session_id: {bot.session_id} (attempt {retry_count + 1}/{max_retries})...")
+            await bot.start()
+            logging.info(f"Bot with session_id: {bot.session_id} started successfully")
+            return  # Exit the function if the bot starts successfully
+        except Exception as e:
+            retry_count += 1
+            logging.error(f"Error in bot {bot.session_id} on attempt {retry_count}: {e}")
+            if retry_count >= max_retries:
+                log_failed_bot(bot.session_id)
+                break  # Stop retrying after max retries
 
 
 async def setup_client(account_folder):
@@ -386,10 +440,13 @@ async def setup_client(account_folder):
     client = await tdesk.ToTelethon(session=session_name, flag=UseCurrentSession)
     await client.connect()
     if not await client.is_user_authorized():
-        print(f"Client {session_name} is not authorized.")
+        logging.error(f"Client {session_name} is not authorized.")
+        log_failed_bot(os.path.basename(account_folder), reason="Not authorized")
+        return None
     else:
-        print(f"Client {session_name} is authorized.")
+        logging.info(f"Client {session_name} is authorized.")
     return client
+
 
 
 async def main():
@@ -407,37 +464,61 @@ async def main():
     account_folders = [folder for folder in os.listdir(base_folder) if folder.isdigit()]
 
     bots = []
-    try:
-        for folder in account_folders:
-            account_name = os.path.basename(os.path.join(base_folder, folder))
-            logging.info(f"Processing row: {account_name}")
+    for folder in account_folders:
+        account_name = os.path.basename(os.path.join(base_folder, folder))
+        logging.info(f"Processing account folder: {account_name}")
 
-            try:
-                client = await setup_client(os.path.join(base_folder, folder))
-                me = await client.get_me()
-                bot = TelegramBot(
-                    session_id=os.path.basename(account_name),
-                    invite_links=invite_links,
-                    client=client,
-                    phone_number= me.phone
-                )
-                bots.append(bot)
-                logging.info(f"Successfully created bot with session_id: {account_name}")
-            except ValueError as e:
-                logging.error(f"Invalid data in CSV row: {account_name}. Error: {e}")
-            except KeyError as e:
-                logging.error(f"Missing key in CSV row: {account_name}. Error: {e}")
-    except Exception as e:
-        logging.error(f"An error occurred while reading the CSV file: {e}")
-        return
+        try:
+            client = await setup_client(os.path.join(base_folder, folder))
+            if not client:
+                continue  # Skip if the client is not authorized
+
+            me = await client.get_me()
+            bot = TelegramBot(
+                session_id=os.path.basename(account_name),
+                invite_links=invite_links,
+                client=client,
+                phone_number=me.phone
+            )
+            bots.append(bot)
+            logging.info(f"Successfully created bot with session_id: {account_name}")
+        except ValueError as e:
+            logging.error(f"Invalid data for account folder: {account_name}. Error: {e}")
+            log_failed_bot(account_name, reason="Invalid data")
+        except KeyError as e:
+            logging.error(f"Missing key for account folder: {account_name}. Error: {e}")
+            log_failed_bot(account_name, reason="Missing key")
+        except Exception as e:
+            logging.error(f"Unexpected error for account folder: {account_name}. Error: {e}")
+            log_failed_bot(account_name, reason="Unexpected error")
 
     if not bots:
-        logging.error("No bots were created. Check your CSV file and logs for errors.")
+        logging.error("No bots were created. Check your account folders and logs for errors.")
         return
 
     bots.sort(key=lambda x: x.session_id)
-
     await asyncio.gather(*(run_bot(bot) for bot in bots))
+
+    processes = []
+    for bot in bots:
+        p = multiprocessing.Process(target=run_bot_process, args=(bot,))
+        p.start()
+        processes.append(p)
+    for p in processes:
+        p.join()
+
+
+def run_bot_process(bot):
+    asyncio.run(run_bot(bot))
+
+
+def log_failed_bot(session_id, reason="Unknown"):
+    log_file = 'failed_bots.log'
+    with open(log_file, 'a') as file:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        file.write(f"{timestamp} - Bot session ID {session_id} failed: {reason}\n")
+    logging.warning(f"Logged failure for bot session ID {session_id} due to: {reason}")
+
 
 
 if __name__ == '__main__':

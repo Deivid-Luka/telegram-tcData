@@ -24,8 +24,8 @@ class TelegramBot:
         self.groups_to_write = [-4524328298]
         self.your_user_id = '@togoshpk'
         self.command_group_id = -4546268393
-        self.forward_to_group = -4564787398
-        self.message_group = -4590396862
+        self.forward_to_group = -4580823805
+        self.message_group = -2337220659
         self.messages = {"text": "+123456789+123456789", "photo": "testt.png"}
         self.active = False
         self.last_sent_time = {group_id: 0 for group_id in self.groups_to_write}
@@ -59,15 +59,15 @@ class TelegramBot:
 
             await self.client.get_dialogs()  # This marks all previous updates as read
 
-            # Join required groups if not already a member
-            await self.ensure_command_group_membership(self.command_group_invite)
-            await self.ensure_command_group_membership(self.messages_group_invite, group_type='message')
-            await self.ensure_command_group_membership(self.forward_to_group_invite, group_type='forward')
+            # # Join required groups if not already a member
+            # await self.ensure_command_group_membership(self.command_group_invite)
+            # await self.ensure_command_group_membership(self.messages_group_invite, group_type='message')
+            # await self.ensure_command_group_membership(self.forward_to_group_invite, group_type='forward')
 
             await self.setup_handlers()
             await asyncio.gather(
                 self.send_message_loop(),
-                self.join_groups_periodically()
+                # self.join_groups_periodically()
             )
         except SessionPasswordNeededError:
             logging.error(
@@ -448,10 +448,41 @@ async def setup_client(account_folder):
     return client
 
 
+def run_bot_process_safe(session_id, invite_links, account_folder):
+    """
+    A wrapper to safely run the bot in a separate process.
+    """
+    try:
+        asyncio.run(run_bot(session_id, invite_links, account_folder))
+    except Exception as e:
+        logging.error(f"Error in bot process for session_id {session_id}: {e}")
 
-async def main():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+async def run_bot(session_id, invite_links, account_folder):
+    """
+    Runs a single bot instance asynchronously.
+    """
+    client = await setup_client(account_folder)
+    if not client:
+        logging.error(f"Failed to set up client for session_id {session_id}")
+        return
+
+    me = await client.get_me()
+    bot = TelegramBot(
+        session_id=session_id,
+        invite_links=invite_links,
+        client=client,
+        phone_number=me.phone
+    )
+
+    logging.info(f"Starting bot {session_id}...")
+    await bot.start()
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+    # Load invite links
     try:
         with open('invites.txt', 'r') as f:
             invite_links = [line.strip() for line in f if line.strip()]
@@ -463,56 +494,30 @@ async def main():
     base_folder = '.'
     account_folders = [folder for folder in os.listdir(base_folder) if folder.isdigit()]
 
-    bots = []
-    for folder in account_folders:
-        account_name = os.path.basename(os.path.join(base_folder, folder))
-        logging.info(f"Processing account folder: {account_name}")
-
-        try:
-            client = await setup_client(os.path.join(base_folder, folder))
-            if not client:
-                continue  # Skip if the client is not authorized
-
-            me = await client.get_me()
-            bot = TelegramBot(
-                session_id=os.path.basename(account_name),
-                invite_links=invite_links,
-                client=client,
-                phone_number=me.phone
-            )
-            bots.append(bot)
-            logging.info(f"Successfully created bot with session_id: {account_name}")
-        except ValueError as e:
-            logging.error(f"Invalid data for account folder: {account_name}. Error: {e}")
-            log_failed_bot(account_name, reason="Invalid data")
-        except KeyError as e:
-            logging.error(f"Missing key for account folder: {account_name}. Error: {e}")
-            log_failed_bot(account_name, reason="Missing key")
-        except Exception as e:
-            logging.error(f"Unexpected error for account folder: {account_name}. Error: {e}")
-            log_failed_bot(account_name, reason="Unexpected error")
-
-    if not bots:
-        logging.error("No bots were created. Check your account folders and logs for errors.")
-        return
-
-    bots.sort(key=lambda x: x.session_id)
-    await asyncio.gather(*(run_bot(bot) for bot in bots))
-
     processes = []
-    for bot in bots:
-        p = multiprocessing.Process(target=run_bot_process, args=(bot,))
-        p.start()
-        processes.append(p)
-    for p in processes:
-        p.join()
+    for folder in account_folders:
+        session_id = os.path.basename(folder)
+        account_folder = os.path.join(base_folder, folder)
 
+        # Create a separate process for each bot
+        process = multiprocessing.Process(
+            target=run_bot_process_safe, args=(session_id, invite_links, account_folder)
+        )
+        processes.append(process)
 
-def run_bot_process(bot):
-    asyncio.run(run_bot(bot))
+    # Start all processes
+    for process in processes:
+        process.start()
+
+    # Wait for all processes to complete
+    for process in processes:
+        process.join()
 
 
 def log_failed_bot(session_id, reason="Unknown"):
+    """
+    Logs a failed bot to a file.
+    """
     log_file = 'failed_bots.log'
     with open(log_file, 'a') as file:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -520,6 +525,5 @@ def log_failed_bot(session_id, reason="Unknown"):
     logging.warning(f"Logged failure for bot session ID {session_id} due to: {reason}")
 
 
-
-if __name__ == '__main__':
-    asyncio.run(main())
+if __name__ == "__main__":
+    main()

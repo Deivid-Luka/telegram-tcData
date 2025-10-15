@@ -22,22 +22,24 @@ class TelegramBot:
         self.session_id = session_id
         self.session_file = f'session_{session_id}'
         self.groups_to_write = [-4524328298]
+        self.default_group_limit = 60
         self.your_user_id = '@togoshpk'
-        self.command_group_id = -4546268393
-        self.forward_to_group = -4580823805
-        self.message_group = -2337220659
+        self.command_group_id = -4811247148
+        self.forward_to_group = -4842019800
+        self.message_group = -4784715732
         self.messages = {"text": "+123456789+123456789", "photo": "testt.png"}
         self.active = False
         self.last_sent_time = {group_id: 0 for group_id in self.groups_to_write}
-        self.group_limits = {group_id: 10 for group_id in self.groups_to_write}
-        self.command_group_invite = "https://t.me/+odbrGCND9zxjZThk"
-        self.messages_group_invite = "https://t.me/+V34Im4h36nMwZTQ8"
-        self.forward_to_group_invite = "https://t.me/+CcS1ejOPnHw4NDBk"
+        self.group_limits = {group_id: self.default_group_limit for group_id in self.groups_to_write}
+        self.command_group_invite = "https://t.me/+MbNH2JFIZD8zN2Vk"
+        self.messages_group_invite = "https://t.me/+n0JdpJSFkkk0YzZk"
+        self.forward_to_group_invite = "https://t.me/+_65l-IAyfC9lYTM8"
         self.start_time = "09:00"
         self.end_time = "23:00"
         self.file_path = os.path.join(directory, f"{session_id}_progress.log")
         self.invite_links = invite_links
         self.last_invite_index = 0
+        self.background_tasks = []
         os.makedirs(directory, exist_ok=True)
 
     async def ensure_command_group_membership(self, invite_link=None, group_type='command'):
@@ -60,15 +62,27 @@ class TelegramBot:
             await self.client.get_dialogs()  # This marks all previous updates as read
 
             # # Join required groups if not already a member
-            # await self.ensure_command_group_membership(self.command_group_invite)
-            # await self.ensure_command_group_membership(self.messages_group_invite, group_type='message')
-            # await self.ensure_command_group_membership(self.forward_to_group_invite, group_type='forward')
+            await self.ensure_command_group_membership(self.command_group_invite)
+            await self.ensure_command_group_membership(self.messages_group_invite, group_type='message')
+            await self.ensure_command_group_membership(self.forward_to_group_invite, group_type='forward')
 
             await self.setup_handlers()
-            await asyncio.gather(
-                self.send_message_loop(),
-                # self.join_groups_periodically()
-            )
+
+            self.background_tasks = [
+                asyncio.create_task(self.send_message_loop(), name=f"send-loop-{self.session_id}")
+            ]
+
+            if self.invite_links:
+                self.background_tasks.append(
+                    asyncio.create_task(self.join_groups_periodically(), name=f"join-loop-{self.session_id}")
+                )
+
+            try:
+                await asyncio.gather(*self.background_tasks)
+            finally:
+                for task in self.background_tasks:
+                    task.cancel()
+                await asyncio.gather(*self.background_tasks, return_exceptions=True)
         except SessionPasswordNeededError:
             logging.error(
                 f"Two-step verification is enabled for {self.phone_number}. Please disable it or handle it in the code.")
@@ -254,11 +268,8 @@ class TelegramBot:
         if len(message) > 2:
             group_id = int(message[1])
             new_limit = int(message[2])
-            if group_id in self.group_limits:
-                self.group_limits[group_id] = new_limit
-                await event.respond(f"Limit for group {group_id} set to {new_limit} seconds.")
-            else:
-                await event.respond(f"Group {group_id} not found.")
+            self.group_limits[group_id] = new_limit
+            await event.respond(f"Limit for group {group_id} set to {new_limit} seconds.")
 
     async def join_group(self, event, message):
         if len(message) > 2 and int(message[1]) == self.session_id:
@@ -329,6 +340,8 @@ class TelegramBot:
                                                                               abs(self.forward_to_group),
                                                                               abs(self.message_group)}:
                     new_groups.append(chat.id)
+                    self.group_limits.setdefault(chat.id, self.default_group_limit)
+                    self.last_sent_time.setdefault(chat.id, 0)
                     response += f"{chat.id}: {chat.title}\n"
             self.groups_to_write.extend(new_groups)
             await event.respond(f"Groups to write updated with {len(new_groups)} new groups.")
@@ -369,13 +382,35 @@ class TelegramBot:
                                 caption = message.message or "No caption"
 
                                 message_start_time = time.time()
-                                selected_group = random.choice([group_id for group_id in self.groups_to_write if
-                                                                abs(group_id) not in {abs(self.command_group_id),
-                                                                                      abs(self.forward_to_group),
-                                                                                      abs(self.message_group)}])
+                                eligible_groups = []
+                                cooldown_remaining = []
+                                current_timestamp = time.time()
+                                excluded_ids = {abs(self.command_group_id), abs(self.forward_to_group),
+                                                abs(self.message_group)}
+
+                                for group_id in self.groups_to_write:
+                                    if abs(group_id) in excluded_ids:
+                                        continue
+
+                                    limit_seconds = self.group_limits.get(group_id, self.default_group_limit)
+                                    last_sent = self.last_sent_time.get(group_id, 0)
+                                    elapsed = current_timestamp - last_sent
+
+                                    if limit_seconds <= 0 or elapsed >= limit_seconds:
+                                        eligible_groups.append(group_id)
+                                    else:
+                                        cooldown_remaining.append(limit_seconds - elapsed)
+
+                                if not eligible_groups:
+                                    sleep_for = max(min(cooldown_remaining, default=5), 1) if cooldown_remaining else 5
+                                    await asyncio.sleep(sleep_for)
+                                    continue
+
+                                selected_group = random.choice(eligible_groups)
 
                                 await self.client.send_file(selected_group, message.photo, caption=caption)
                                 message_end_time = time.time()
+                                self.last_sent_time[selected_group] = message_end_time
 
                                 elapsed_time = message_end_time - message_start_time
                                 print(f"Message sent to group {selected_group} in {elapsed_time:.2f} seconds")
@@ -409,7 +444,7 @@ class TelegramBot:
         return datetime.strptime(time_str, "%H:%M").time()
 
 
-async def run_bot(bot):
+async def run_bot_instance(bot):
     max_retries = 2
     retry_count = 0
 
@@ -434,7 +469,11 @@ async def setup_client(account_folder):
         raise FileNotFoundError(f"tdata folder not found in {account_folder}")
 
     tdesk = TDesktop(tdata_folder)
-    assert tdesk.isLoaded(), f"Failed to load account from {tdata_folder}"
+    if not tdesk.isLoaded():
+        session_id = os.path.basename(account_folder)
+        logging.error(f"Failed to load account from {tdata_folder}")
+        log_failed_bot(session_id, reason="tdata not loaded")
+        return None
 
     session_name = f"session_{os.path.basename(account_folder)}"
     client = await tdesk.ToTelethon(session=session_name, flag=UseCurrentSession)
@@ -476,7 +515,7 @@ async def run_bot(session_id, invite_links, account_folder):
     )
 
     logging.info(f"Starting bot {session_id}...")
-    await bot.start()
+    await run_bot_instance(bot)
 
 
 def main():

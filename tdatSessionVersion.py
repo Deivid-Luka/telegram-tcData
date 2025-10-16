@@ -12,6 +12,13 @@ from telethon.errors import (
     ChannelsTooMuchError,
     InviteHashExpiredError,
     InviteHashInvalidError,
+    ChatWriteForbiddenError,
+    ChatWriteRestrictedError,
+    ChatAdminRequiredError,
+    UserBannedInChannelError,
+    ChannelPrivateError,
+    PeerIdInvalidError,
+    RPCError,
 )
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, GetDialogsRequest
@@ -56,6 +63,11 @@ class TelegramBot:
         self.join_failure_threshold = 3
         self.join_disabled = False
         self.join_disabled_reason = None
+        self.group_failures = {}
+        self.disabled_groups = set()
+        self.failure_threshold = 3
+        self.failure_cooldown = 60 * 60
+        self.send_interval = 120
         self.background_tasks = []
         os.makedirs(directory, exist_ok=True)
 
@@ -168,6 +180,32 @@ class TelegramBot:
             if len(parts) == 2:
                 break
         return " ".join(parts) if parts else "<1s"
+
+    def _disable_group(self, group_id, reason):
+        if group_id in self.disabled_groups:
+            return
+        self.disabled_groups.add(group_id)
+        self.group_limits[group_id] = float('inf')
+        self.last_sent_time[group_id] = time.time()
+        logging.warning(
+            f"Session {self.session_id} disabled group {group_id} due to repeated failures: {reason}"
+        )
+
+    def _mark_group_failure(self, group_id, reason, disable=False):
+        if group_id is None:
+            return
+        count = self.group_failures.get(group_id, 0) + 1
+        self.group_failures[group_id] = count
+        cooldown = min(self.failure_cooldown, max(60, count * 300))
+        current_limit = self.group_limits.get(group_id, self.default_group_limit)
+        self.group_limits[group_id] = max(current_limit, cooldown)
+        self.last_sent_time[group_id] = time.time()
+        logging.warning(
+            f"Session {self.session_id} encountered error sending to {group_id} "
+            f"({count}/{self.failure_threshold}): {reason}"
+        )
+        if disable or count >= self.failure_threshold:
+            self._disable_group(group_id, reason)
 
     def load_last_position(self):
         if not os.path.exists(self.file_path):
@@ -474,6 +512,8 @@ class TelegramBot:
                     new_groups.append(chat.id)
                     self.group_limits.setdefault(chat.id, self.default_group_limit)
                     self.last_sent_time.setdefault(chat.id, 0)
+                    self.group_failures.setdefault(chat.id, 0)
+                    self.disabled_groups.discard(chat.id)
                     response += f"{chat.id}: {chat.title}\n"
             self.groups_to_write.extend(new_groups)
             await event.respond(f"Groups to write updated with {len(new_groups)} new groups.")
@@ -507,61 +547,108 @@ class TelegramBot:
             if start_time_obj <= current_time <= end_time_obj and self.active:
                 total_messages = await self.get_total_message_count(self.message_group)
                 if total_messages > 0 and self.active:
+                    selected_group = None
                     try:
                         message = await self.get_regular_message(self.message_group, total_messages)
                         if message:
                             if message.photo:
                                 caption = message.message or "No caption"
 
-                                message_start_time = time.time()
+                                current_timestamp = time.time()
                                 eligible_groups = []
                                 cooldown_remaining = []
-                                current_timestamp = time.time()
-                                excluded_ids = {abs(self.command_group_id), abs(self.forward_to_group),
-                                                abs(self.message_group)}
-
+                                excluded_ids = {
+                                    abs(self.command_group_id),
+                                    abs(self.forward_to_group),
+                                    abs(self.message_group),
+                                }
                                 for group_id in self.groups_to_write:
                                     if abs(group_id) in excluded_ids:
                                         continue
-
+                                    if group_id in self.disabled_groups:
+                                        continue
+                                    self.group_limits.setdefault(group_id, self.default_group_limit)
+                                    self.last_sent_time.setdefault(group_id, 0)
+                                    self.group_failures.setdefault(group_id, 0)
                                     limit_seconds = self.group_limits.get(group_id, self.default_group_limit)
                                     last_sent = self.last_sent_time.get(group_id, 0)
                                     elapsed = current_timestamp - last_sent
 
                                     if limit_seconds <= 0 or elapsed >= limit_seconds:
                                         eligible_groups.append(group_id)
-                                    else:
+                                    elif limit_seconds != float('inf'):
                                         cooldown_remaining.append(limit_seconds - elapsed)
 
                                 if not eligible_groups:
-                                    sleep_for = max(min(cooldown_remaining, default=5), 1) if cooldown_remaining else 5
+                                    sleep_for = (
+                                        max(min(cooldown_remaining), 5)
+                                        if cooldown_remaining
+                                        else max(self.send_interval, 5)
+                                    )
                                     await asyncio.sleep(sleep_for)
                                     continue
 
                                 selected_group = random.choice(eligible_groups)
+                                message_start_time = time.time()
+                                try:
+                                    await self.client.send_file(selected_group, message.photo, caption=caption)
+                                    message_end_time = time.time()
+                                    self.last_sent_time[selected_group] = message_end_time
+                                    self.last_message_timestamp = message_end_time
+                                    self.group_failures[selected_group] = 0
+                                    self.disabled_groups.discard(selected_group)
 
-                                await self.client.send_file(selected_group, message.photo, caption=caption)
-                                message_end_time = time.time()
-                                self.last_sent_time[selected_group] = message_end_time
-                                self.last_message_timestamp = message_end_time
+                                    elapsed_time = message_end_time - message_start_time
+                                    print(f"Message sent to group {selected_group} in {elapsed_time:.2f} seconds")
 
-                                elapsed_time = message_end_time - message_start_time
-                                print(f"Message sent to group {selected_group} in {elapsed_time:.2f} seconds")
-
-                                await asyncio.sleep(15)
+                                    jitter = random.uniform(-0.25, 0.25)
+                                    delay = max(5, self.send_interval * (1 + jitter))
+                                    await asyncio.sleep(delay)
+                                except FloodWaitError as e:
+                                    wait = int(e.seconds) + 10
+                                    self.group_limits[selected_group] = max(
+                                        self.group_limits.get(selected_group, self.default_group_limit), wait
+                                    )
+                                    self.last_sent_time[selected_group] = time.time()
+                                    logging.warning(
+                                        f"Session {self.session_id} hit flood wait ({wait}s) sending to {selected_group}"
+                                    )
+                                    await asyncio.sleep(e.seconds)
+                                except (
+                                        ChatWriteForbiddenError,
+                                        ChatWriteRestrictedError,
+                                        ChatAdminRequiredError,
+                                        UserBannedInChannelError,
+                                        ChannelPrivateError,
+                                ) as e:
+                                    self._mark_group_failure(selected_group, str(e), disable=True)
+                                    await asyncio.sleep(5)
+                                except PeerIdInvalidError as e:
+                                    self._mark_group_failure(selected_group, "Invalid peer", disable=True)
+                                    await asyncio.sleep(5)
+                                except RPCError as e:
+                                    self._mark_group_failure(selected_group, str(e))
+                                    await asyncio.sleep(5)
+                                except Exception as e:
+                                    self._mark_group_failure(selected_group, str(e))
+                                    await asyncio.sleep(5)
                             else:
                                 print("Fetched message does not contain a photo.")
+                                await asyncio.sleep(10)
                         else:
                             print("Could not find a regular message after several attempts.")
+                            await asyncio.sleep(10)
                     except FloodWaitError as e:
                         print(f"Flood wait error for group {self.message_group}: {e.seconds} seconds")
                         await asyncio.sleep(e.seconds)
                     except Exception as e:
                         print(f"Error while sending message to group {self.message_group}: {e}")
-                        await asyncio.sleep(2)
+                        if selected_group is not None:
+                            self._mark_group_failure(selected_group, str(e))
+                        await asyncio.sleep(5)
                     pass
                 else:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(10)
                     print(f"No messages found in group {self.message_group}.")
             else:
                 print("Current time is outside the specified time range for sending messages.")

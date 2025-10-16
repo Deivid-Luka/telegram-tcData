@@ -2,13 +2,21 @@ import logging
 import os
 import time
 import multiprocessing
+import sqlite3
 
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError, SessionPasswordNeededError, UserAlreadyParticipantError
+from telethon.errors import (
+    FloodWaitError,
+    SessionPasswordNeededError,
+    UserAlreadyParticipantError,
+    ChannelsTooMuchError,
+    InviteHashExpiredError,
+    InviteHashInvalidError,
+)
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, GetDialogsRequest
 from telethon.tl.types import InputPeerEmpty, Chat, Channel, Message, MessageService
-from datetime import datetime
+from datetime import datetime, timedelta
 from opentele.td import TDesktop
 from opentele.api import UseCurrentSession
 import random
@@ -39,6 +47,14 @@ class TelegramBot:
         self.file_path = os.path.join(directory, f"{session_id}_progress.log")
         self.invite_links = invite_links
         self.last_invite_index = 0
+        self.join_batch_size = 3
+        self.join_attempt_interval = 60
+        self.join_cycle_interval = 30 * 60
+        self.join_block_until = datetime.min
+        self.join_failures = 0
+        self.join_failure_threshold = 3
+        self.join_disabled = False
+        self.join_disabled_reason = None
         self.background_tasks = []
         os.makedirs(directory, exist_ok=True)
 
@@ -50,6 +66,7 @@ class TelegramBot:
         except UserAlreadyParticipantError:
             logging.info(f"Bot {self.session_id} is already in the {group_type} group.")
         except Exception as e:
+            self._handle_join_penalty(e)
             logging.error(f"Failed to join {group_type} group for bot {self.session_id}: {e}")
             raise
 
@@ -92,15 +109,38 @@ class TelegramBot:
             raise
 
     async def join_desired_group(self, message):
-        try:
-            if "joinchat" in message or "+" in message:
-                hash_part = message.split('/')[-1].replace('+', '')
-                await self.client(ImportChatInviteRequest(hash_part))
-            else:
-                await self.client(JoinChannelRequest(message))
-                logging.info(f"Bot {self.session_id} joined the group with invite link: {message}")
-        except Exception as e:
-            logging.error(f"Error while joining group: {e}")
+        if "joinchat" in message or "+" in message:
+            hash_part = message.split('/')[-1].replace('+', '')
+            await self.client(ImportChatInviteRequest(hash_part))
+        else:
+            await self.client(JoinChannelRequest(message))
+
+    @staticmethod
+    def _join_error_message(error):
+        if isinstance(error, UserAlreadyParticipantError):
+            return "Already a participant"
+        if isinstance(error, ChannelsTooMuchError):
+            return "Reached Telegram limit for channels/supergroups"
+        if isinstance(error, FloodWaitError):
+            return f"Flood wait {int(error.seconds)} seconds"
+        if isinstance(error, InviteHashExpiredError):
+            return "Invite expired"
+        if isinstance(error, InviteHashInvalidError):
+            return "Invite invalid or revoked"
+        if isinstance(error, sqlite3.OperationalError):
+            return "Local session database is locked"
+        return str(error)
+
+    def _handle_join_penalty(self, error):
+        reason = self._join_error_message(error)
+        if isinstance(error, ChannelsTooMuchError):
+            self.join_disabled = True
+            self.join_disabled_reason = reason
+        elif isinstance(error, FloodWaitError):
+            wait_seconds = int(error.seconds) + 10
+            self.join_block_until = datetime.utcnow() + timedelta(seconds=wait_seconds)
+        elif isinstance(error, sqlite3.OperationalError):
+            self.join_block_until = datetime.utcnow() + timedelta(minutes=5)
 
     def load_last_position(self):
         if not os.path.exists(self.file_path):
@@ -130,38 +170,98 @@ class TelegramBot:
         last_invite_index = self.load_last_position()
 
         while True:
-            start_index = last_invite_index
-            end_index = start_index + 15
+            if not self.invite_links:
+                await asyncio.sleep(self.join_cycle_interval)
+                continue
 
-            if end_index <= len(self.invite_links):
-                invite_links_to_try = self.invite_links[start_index:end_index]
-            else:
-                invite_links_to_try = self.invite_links[start_index:] + self.invite_links[
-                                                                        :end_index % len(self.invite_links)]
+            if self.join_disabled:
+                if self.join_disabled_reason:
+                    logging.warning(
+                        f"Join loop for session {self.session_id} is disabled: {self.join_disabled_reason}"
+                    )
+                    self.join_disabled_reason = None
+                await asyncio.sleep(self.join_cycle_interval)
+                continue
+
+            now = datetime.utcnow()
+            if now < self.join_block_until:
+                wait_seconds = max((self.join_block_until - now).total_seconds(), 5)
+                logging.debug(
+                    f"Session {self.session_id} waiting {wait_seconds:.0f}s before next join attempt."
+                )
+                await asyncio.sleep(wait_seconds)
+                continue
+
+            batch = []
+            invite_len = len(self.invite_links)
+            for _ in range(min(self.join_batch_size, invite_len)):
+                position = last_invite_index % invite_len
+                batch.append((self.invite_links[position], position))
+                last_invite_index = (last_invite_index + 1) % invite_len
 
             error_count = 0
             last_joined_link = None
 
-            for i, invite_link in enumerate(invite_links_to_try, start=start_index):
+            for attempt_index, (invite_link, position) in enumerate(batch):
+                now = datetime.utcnow()
+                if now < self.join_block_until or self.join_disabled:
+                    break
+
+                if attempt_index > 0:
+                    await asyncio.sleep(self.join_attempt_interval)
+
                 try:
                     await self.join_desired_group(invite_link)
                     logging.info(f"Bot {self.session_id} joined group: {invite_link}")
                     last_joined_link = invite_link
+                    self.join_failures = 0
                 except UserAlreadyParticipantError:
-                    logging.info(f"Bot {self.session_id} is already in the group: {invite_link}")
+                    logging.debug(f"Session {self.session_id} already in group: {invite_link}")
+                except ChannelsTooMuchError as e:
+                    logging.warning(
+                        f"Session {self.session_id} reached the maximum joined channels. Disabling further joins."
+                    )
+                    self._handle_join_penalty(e)
+                    break
+                except FloodWaitError as e:
+                    logging.warning(
+                        f"Session {self.session_id} hit flood wait ({int(e.seconds)}s) on join."
+                    )
+                    self._handle_join_penalty(e)
+                    break
+                except (InviteHashExpiredError, InviteHashInvalidError):
+                    logging.info(
+                        f"Session {self.session_id} failed to join (invalid invite): {invite_link}"
+                    )
+                    error_count += 1
+                except sqlite3.OperationalError as e:
+                    logging.error(
+                        f"Session {self.session_id} encountered database lock while joining: {e}"
+                    )
+                    self._handle_join_penalty(e)
+                    break
                 except Exception as e:
                     error_count += 1
-                    logging.error(f"Bot {self.session_id} failed to join group {invite_link}: {e}")
+                    self.join_failures += 1
+                    logging.error(
+                        f"Session {self.session_id} failed to join group {invite_link}: {e}"
+                    )
+                    self._handle_join_penalty(e)
+                    if self.join_failures >= self.join_failure_threshold:
+                        cooldown_minutes = 30
+                        logging.warning(
+                            f"Session {self.session_id} backing off joins for {cooldown_minutes} minutes "
+                            f"after repeated failures."
+                        )
+                        self.join_block_until = datetime.utcnow() + timedelta(minutes=cooldown_minutes)
+                        self.join_failures = 0
+                        break
 
-                await asyncio.sleep(2)
+            if self.invite_links:
+                last_position = (last_invite_index - 1) % len(self.invite_links)
+                await self.save_progress(last_joined_link, last_position, error_count)
 
-            last_position = (end_index - 1) % len(self.invite_links)
-            await self.save_progress(last_joined_link, last_position, error_count)
-
-            # Update last invite index for the next batch
-            last_invite_index = end_index % len(self.invite_links)
-
-            await asyncio.sleep(2 * 60 * 60)
+            await asyncio.sleep(self.join_cycle_interval)
 
     async def setup_handlers(self):
         @self.client.on(events.NewMessage(incoming=True, chats=None))
@@ -275,27 +375,27 @@ class TelegramBot:
         if len(message) > 2 and int(message[1]) == self.session_id:
             invite_link = message[2]
             try:
-                if "joinchat" in invite_link or "+" in invite_link:
-                    hash_part = invite_link.split('/')[-1].replace('+', '')
-                    await self.client(ImportChatInviteRequest(hash_part))
-                else:
-                    await self.client(JoinChannelRequest(invite_link))
+                await self.join_desired_group(invite_link)
+                self.join_failures = 0
                 await event.respond(f"Session {self.session_id} joined the group with invite link: {invite_link}")
+            except UserAlreadyParticipantError:
+                await event.respond(f"Session {self.session_id} is already in that group.")
             except Exception as e:
-                await event.respond(f"Error while joining group: {e}")
+                self._handle_join_penalty(e)
+                await event.respond(f"Error while joining group: {self._join_error_message(e)}")
 
     async def join_group_all(self, event, message):
         if len(message) > 1:
             invite_link = message[1]
             try:
-                if "joinchat" in invite_link or "+" in invite_link:
-                    hash_part = invite_link.split('/')[-1].replace('+', '')
-                    await self.client(ImportChatInviteRequest(hash_part))
-                else:
-                    await self.client(JoinChannelRequest(invite_link))
+                await self.join_desired_group(invite_link)
+                self.join_failures = 0
                 await event.respond(f"Session {self.session_id} joined the group with invite link: {invite_link}")
+            except UserAlreadyParticipantError:
+                await event.respond(f"Session {self.session_id} is already in that group.")
             except Exception as e:
-                await event.respond(f"Error while joining group: {e}")
+                self._handle_join_penalty(e)
+                await event.respond(f"Error while joining group: {self._join_error_message(e)}")
 
     async def list_groups(self, event, message):
         try:
@@ -468,22 +568,31 @@ async def setup_client(account_folder):
     if not os.path.exists(tdata_folder):
         raise FileNotFoundError(f"tdata folder not found in {account_folder}")
 
+    session_id = os.path.basename(account_folder)
     tdesk = TDesktop(tdata_folder)
     if not tdesk.isLoaded():
-        session_id = os.path.basename(account_folder)
         logging.error(f"Failed to load account from {tdata_folder}")
         log_failed_bot(session_id, reason="tdata not loaded")
         return None
 
-    session_name = f"session_{os.path.basename(account_folder)}"
+    session_name = f"session_{session_id}"
     client = await tdesk.ToTelethon(session=session_name, flag=UseCurrentSession)
-    await client.connect()
-    if not await client.is_user_authorized():
-        logging.error(f"Client {session_name} is not authorized.")
-        log_failed_bot(os.path.basename(account_folder), reason="Not authorized")
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            logging.error(f"Client {session_name} is not authorized.")
+            log_failed_bot(session_id, reason="Not authorized")
+            return None
+    except sqlite3.OperationalError as e:
+        logging.error(f"Client {session_name} failed to open session database: {e}")
+        log_failed_bot(session_id, reason="Session database locked")
         return None
-    else:
-        logging.info(f"Client {session_name} is authorized.")
+    except Exception as e:
+        logging.error(f"Client {session_name} failed to connect: {e}")
+        log_failed_bot(session_id, reason=str(e))
+        return None
+
+    logging.info(f"Client {session_name} is authorized.")
     return client
 
 
@@ -534,7 +643,7 @@ def main():
     account_folders = [folder for folder in os.listdir(base_folder) if folder.isdigit()]
 
     processes = []
-    for folder in account_folders:
+    for idx, folder in enumerate(account_folders):
         session_id = os.path.basename(folder)
         account_folder = os.path.join(base_folder, folder)
 
@@ -542,11 +651,11 @@ def main():
         process = multiprocessing.Process(
             target=run_bot_process_safe, args=(session_id, invite_links, account_folder)
         )
+        process.start()
         processes.append(process)
 
-    # Start all processes
-    for process in processes:
-        process.start()
+        if idx < len(account_folders) - 1:
+            time.sleep(1)
 
     # Wait for all processes to complete
     for process in processes:

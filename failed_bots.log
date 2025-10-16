@@ -1,0 +1,5 @@
+2025-10-16 09:02:53 - Bot session ID 56950241606 failed: Not authorized
+2025-10-16 09:10:40 - Bot session ID 17193124331 failed: The authorization key (session file) was used under two different IP addresses simultaneously, and can no longer be used. Use the same session exclusively, or use different sessions (caused by InvokeWithLayerRequest(InitConnectionRequest(GetConfigRequest)))
+2025-10-16 09:10:45 - Bot session ID 27602721254 failed: The authorization key (session file) was used under two different IP addresses simultaneously, and can no longer be used. Use the same session exclusively, or use different sessions (caused by InvokeWithLayerRequest(InitConnectionRequest(GetConfigRequest)))
+2025-10-16 09:10:49 - Bot session ID 12722440644 failed: The authorization key (session file) was used under two different IP addresses simultaneously, and can no longer be used. Use the same session exclusively, or use different sessions (caused by InvokeWithLayerRequest(InitConnectionRequest(GetConfigRequest)))
+2025-10-16 09:11:03 - Bot session ID 56950241606 failed: Not authorized

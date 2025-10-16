@@ -17,7 +17,7 @@ from telethon.errors import (
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest, GetDialogsRequest
 from telethon.tl.types import InputPeerEmpty, Chat, Channel, Message, MessageService
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from opentele.td import TDesktop
 from opentele.api import UseCurrentSession
 import random
@@ -52,7 +52,7 @@ class TelegramBot:
         self.join_batch_size = 3
         self.join_attempt_interval = 60
         self.join_cycle_interval = 30 * 60
-        self.join_block_until = datetime.min
+        self.join_block_until = datetime.now(timezone.utc)
         self.join_failures = 0
         self.join_failure_threshold = 3
         self.join_disabled = False
@@ -145,15 +145,15 @@ class TelegramBot:
             self.join_disabled_reason = reason
         elif isinstance(error, FloodWaitError):
             wait_seconds = int(error.seconds) + 10
-            self.join_block_until = datetime.utcnow() + timedelta(seconds=wait_seconds)
+            self.join_block_until = datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
         elif isinstance(error, sqlite3.OperationalError):
-            self.join_block_until = datetime.utcnow() + timedelta(minutes=5)
+            self.join_block_until = datetime.now(timezone.utc) + timedelta(minutes=5)
 
     @staticmethod
     def _format_last_sent(timestamp):
         if timestamp <= 0:
             return "never"
-        diff = datetime.utcnow() - datetime.utcfromtimestamp(timestamp)
+        diff = datetime.now(timezone.utc) - datetime.fromtimestamp(timestamp, tz=timezone.utc)
         seconds = diff.total_seconds()
         if seconds < 1:
             return "just now"
@@ -242,7 +242,7 @@ class TelegramBot:
                 await asyncio.sleep(self.join_cycle_interval)
                 continue
 
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             if now < self.join_block_until:
                 wait_seconds = max((self.join_block_until - now).total_seconds(), 5)
                 logging.debug(
@@ -262,7 +262,7 @@ class TelegramBot:
             last_joined_link = None
 
             for attempt_index, (invite_link, position) in enumerate(batch):
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 if now < self.join_block_until or self.join_disabled:
                     break
 
@@ -312,7 +312,7 @@ class TelegramBot:
                             f"Session {self.session_id} backing off joins for {cooldown_minutes} minutes "
                             f"after repeated failures."
                         )
-                        self.join_block_until = datetime.utcnow() + timedelta(minutes=cooldown_minutes)
+                        self.join_block_until = datetime.now(timezone.utc) + timedelta(minutes=cooldown_minutes)
                         self.join_failures = 0
                         break
 

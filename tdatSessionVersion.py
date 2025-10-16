@@ -12,12 +12,6 @@ from telethon.errors import (
     ChannelsTooMuchError,
     InviteHashExpiredError,
     InviteHashInvalidError,
-    ChatWriteForbiddenError,
-    ChatWriteRestrictedError,
-    ChatAdminRequiredError,
-    UserBannedInChannelError,
-    ChannelPrivateError,
-    PeerIdInvalidError,
     RPCError,
 )
 from telethon.tl.functions.channels import JoinChannelRequest
@@ -614,20 +608,19 @@ class TelegramBot:
                                         f"Session {self.session_id} hit flood wait ({wait}s) sending to {selected_group}"
                                     )
                                     await asyncio.sleep(e.seconds)
-                                except (
-                                        ChatWriteForbiddenError,
-                                        ChatWriteRestrictedError,
-                                        ChatAdminRequiredError,
-                                        UserBannedInChannelError,
-                                        ChannelPrivateError,
-                                ) as e:
-                                    self._mark_group_failure(selected_group, str(e), disable=True)
-                                    await asyncio.sleep(5)
-                                except PeerIdInvalidError as e:
-                                    self._mark_group_failure(selected_group, "Invalid peer", disable=True)
-                                    await asyncio.sleep(5)
                                 except RPCError as e:
-                                    self._mark_group_failure(selected_group, str(e))
+                                    error_name = e.__class__.__name__
+                                    disable = error_name in {
+                                        "ChatWriteForbiddenError",
+                                        "ChatWriteRestrictedError",
+                                        "ChatAdminRequiredError",
+                                        "UserBannedInChannelError",
+                                        "ChannelPrivateError",
+                                        "PeerIdInvalidError",
+                                        "ChatSendMediaForbiddenError",
+                                    }
+                                    reason = f"{error_name}: {getattr(e, 'message', str(e))}"
+                                    self._mark_group_failure(selected_group, reason, disable=disable)
                                     await asyncio.sleep(5)
                                 except Exception as e:
                                     self._mark_group_failure(selected_group, str(e))

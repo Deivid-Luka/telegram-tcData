@@ -33,12 +33,13 @@ class TelegramBot:
         self.default_group_limit = 60
         self.your_user_id = '@togoshpk'
         self.command_group_id = -4811247148
-        self.forward_to_group = -4842019800
-        self.message_group = -4784715732
+        self.forward_to_group = -4784715732
+        self.message_group = -4842019800
         self.messages = {"text": "+123456789+123456789", "photo": "testt.png"}
         self.active = False
         self.last_sent_time = {group_id: 0 for group_id in self.groups_to_write}
         self.group_limits = {group_id: self.default_group_limit for group_id in self.groups_to_write}
+        self.last_message_timestamp = 0
         self.command_group_invite = "https://t.me/+MbNH2JFIZD8zN2Vk"
         self.messages_group_invite = "https://t.me/+n0JdpJSFkkk0YzZk"
         self.forward_to_group_invite = "https://t.me/+_65l-IAyfC9lYTM8"
@@ -141,6 +142,32 @@ class TelegramBot:
             self.join_block_until = datetime.utcnow() + timedelta(seconds=wait_seconds)
         elif isinstance(error, sqlite3.OperationalError):
             self.join_block_until = datetime.utcnow() + timedelta(minutes=5)
+
+    @staticmethod
+    def _format_last_sent(timestamp):
+        if timestamp <= 0:
+            return "never"
+        diff = datetime.utcnow() - datetime.utcfromtimestamp(timestamp)
+        seconds = diff.total_seconds()
+        if seconds < 1:
+            return "just now"
+
+        intervals = [
+            (86400, "d"),
+            (3600, "h"),
+            (60, "m"),
+            (1, "s"),
+        ]
+        parts = []
+        for unit_seconds, label in intervals:
+            if seconds >= unit_seconds:
+                value = int(seconds // unit_seconds)
+                seconds -= value * unit_seconds
+                if value:
+                    parts.append(f"{value}{label}")
+            if len(parts) == 2:
+                break
+        return " ".join(parts) if parts else "<1s"
 
     def load_last_position(self):
         if not os.path.exists(self.file_path):
@@ -332,7 +359,12 @@ class TelegramBot:
 
     async def get_status(self, event, message):
         status = 'ON' if self.active else 'OFF'
-        response = f"Session {self.session_id}: {self.phone_number} - {status}"
+        last_sent = max(self.last_sent_time.values(), default=0)
+        human_last_sent = self._format_last_sent(last_sent)
+        response = (
+            f"Session {self.session_id}: {self.phone_number} - {status}\n"
+            f"Last post: {human_last_sent}"
+        )
         await event.respond(response)
 
     async def start_session(self, event, message):
@@ -511,6 +543,7 @@ class TelegramBot:
                                 await self.client.send_file(selected_group, message.photo, caption=caption)
                                 message_end_time = time.time()
                                 self.last_sent_time[selected_group] = message_end_time
+                                self.last_message_timestamp = message_end_time
 
                                 elapsed_time = message_end_time - message_start_time
                                 print(f"Message sent to group {selected_group} in {elapsed_time:.2f} seconds")

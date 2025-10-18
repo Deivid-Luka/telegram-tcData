@@ -22,6 +22,12 @@ from opentele.td import TDesktop
 from opentele.api import UseCurrentSession
 import random
 import asyncio
+from zoneinfo import ZoneInfo
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - platform dependent
+    fcntl = None
 
 
 class TelegramBot:
@@ -31,7 +37,7 @@ class TelegramBot:
         self.session_id = session_id
         self.session_file = f'session_{session_id}'
         self.groups_to_write = [-4524328298]
-        self.default_group_limit = 60
+        self.default_group_limit = 180
         self.your_user_id = '@togoshpk'
         self.command_group_id = -4811247148
         self.forward_to_group = -4784715732
@@ -44,14 +50,15 @@ class TelegramBot:
         self.command_group_invite = "https://t.me/+MbNH2JFIZD8zN2Vk"
         self.messages_group_invite = "https://t.me/+n0JdpJSFkkk0YzZk"
         self.forward_to_group_invite = "https://t.me/+_65l-IAyfC9lYTM8"
-        self.start_time = "09:00"
-        self.end_time = "23:00"
+        self.start_time = "10:00"
+        self.end_time = "22:00"
+        self.timezone = ZoneInfo("Atlantic/Reykjavik")
         self.file_path = os.path.join(directory, f"{session_id}_progress.log")
         self.invite_links = invite_links
         self.last_invite_index = 0
-        self.join_batch_size = 3
-        self.join_attempt_interval = 60
-        self.join_cycle_interval = 30 * 60
+        self.join_batch_size = 2
+        self.join_attempt_interval = 180
+        self.join_cycle_interval = 45 * 60
         self.join_block_until = datetime.now(timezone.utc)
         self.join_failures = 0
         self.join_failure_threshold = 3
@@ -60,10 +67,14 @@ class TelegramBot:
         self.group_failures = {}
         self.disabled_groups = set()
         self.failure_threshold = 3
-        self.failure_cooldown = 60 * 60
-        self.send_interval = 120
+        self.failure_cooldown = 90 * 60
+        self.send_interval = 180
         self.background_tasks = []
+        self.lock_dir = os.path.join(directory, "locks")
         os.makedirs(directory, exist_ok=True)
+        os.makedirs(self.lock_dir, exist_ok=True)
+        self.lock_path = os.path.join(self.lock_dir, f"{self.session_id}.lock")
+        self.lock_handle = None
 
     async def ensure_command_group_membership(self, invite_link=None, group_type='command'):
         logging.info(f"Bot {self.session_id} attempting to join the {group_type} group...")
@@ -78,6 +89,7 @@ class TelegramBot:
             raise
 
     async def start(self):
+        self._acquire_session_lock()
         try:
             await self.client.is_user_authorized()
 
@@ -114,6 +126,8 @@ class TelegramBot:
         except Exception as e:
             logging.error(f"An issue occurred with phone number {self.phone_number}: {e}")
             raise
+        finally:
+            self._release_session_lock()
 
     async def join_desired_group(self, message):
         if "joinchat" in message or "+" in message:
@@ -137,6 +151,55 @@ class TelegramBot:
         if isinstance(error, sqlite3.OperationalError):
             return "Local session database is locked"
         return str(error)
+
+    def _acquire_session_lock(self):
+        if self.lock_handle:
+            return
+        logging.info(f"Attempting to acquire session lock for {self.session_id}")
+        try:
+            if fcntl:
+                handle = open(self.lock_path, "w")
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    handle.close()
+                    raise RuntimeError(
+                        f"Session {self.session_id} is already active elsewhere. "
+                        "Stop the other instance before starting this one."
+                    )
+                handle.write(str(os.getpid()))
+                handle.flush()
+                self.lock_handle = handle
+            else:  # pragma: no cover - non-POSIX fallback
+                fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                self.lock_handle = os.fdopen(fd, "w")
+        except FileExistsError:  # pragma: no cover - fallback path
+            raise RuntimeError(
+                f"Session {self.session_id} appears to be active elsewhere (lock file present). "
+                "Remove stale lock if you're sure no other instance is running."
+            )
+        logging.info(f"Session lock acquired for {self.session_id}")
+
+    def _release_session_lock(self):
+        if not self.lock_handle:
+            return
+        logging.info(f"Releasing session lock for {self.session_id}")
+        try:
+            if fcntl:
+                try:
+                    fcntl.flock(self.lock_handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            self.lock_handle.close()
+        finally:
+            self.lock_handle = None
+        try:
+            os.unlink(self.lock_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logging.debug(f"Unable to remove lock file for session {self.session_id}: {exc}")
 
     def _handle_join_penalty(self, error):
         reason = self._join_error_message(error)
@@ -359,6 +422,7 @@ class TelegramBot:
             '/message': self.set_message,
             '/photo': self.set_photo,
             '/status': self.get_status,
+            '/groups': self.get_group_overview,
             '/start': self.start_session,
             '/stop': self.stop_session,
             '/startAll': self.start_all,
@@ -393,9 +457,13 @@ class TelegramBot:
         status = 'ON' if self.active else 'OFF'
         last_sent = max(self.last_sent_time.values(), default=0)
         human_last_sent = self._format_last_sent(last_sent)
+        total_groups = len(self.groups_to_write)
+        active_groups = sum(1 for group_id in self.groups_to_write if group_id not in self.disabled_groups)
+        disabled_groups = total_groups - active_groups
         response = (
             f"Session {self.session_id}: {self.phone_number} - {status}\n"
-            f"Last post: {human_last_sent}"
+            f"Last post: {human_last_sent}\n"
+            f"Groups: {active_groups}/{total_groups} active (disabled: {disabled_groups})"
         )
         await event.respond(response)
 
@@ -421,6 +489,27 @@ class TelegramBot:
         response = "\n".join(
             [f"Group {group_id}: {self.group_limits[group_id]} seconds" for group_id in self.groups_to_write])
         await event.respond(response)
+
+    async def get_group_overview(self, event, message):
+        total_groups = len(self.groups_to_write)
+        active_groups = [group_id for group_id in self.groups_to_write if group_id not in self.disabled_groups]
+        disabled_groups = [group_id for group_id in self.groups_to_write if group_id in self.disabled_groups]
+        lines = [
+            f"Session {self.session_id} group summary:",
+            f"Total: {total_groups}",
+            f"Active: {len(active_groups)}",
+            f"Disabled: {len(disabled_groups)}",
+        ]
+
+        if active_groups:
+            sample_active = ", ".join(str(group_id) for group_id in active_groups[:20])
+            lines.append(f"Active sample: {sample_active}")
+
+        if disabled_groups:
+            sample_disabled = ", ".join(str(group_id) for group_id in disabled_groups[:20])
+            lines.append(f"Disabled sample: {sample_disabled}")
+
+        await self.send_long_message(event.chat_id, "\n".join(lines))
 
     async def set_time_range(self, event, message):
         if len(message) > 2:
@@ -536,7 +625,7 @@ class TelegramBot:
         while True:
             start_time_obj = self.parse_time(self.start_time)
             end_time_obj = self.parse_time(self.end_time)
-            current_time = datetime.now().time()
+            current_time = datetime.now(self.timezone).time()
 
             if start_time_obj <= current_time <= end_time_obj and self.active:
                 total_messages = await self.get_total_message_count(self.message_group)
@@ -668,6 +757,9 @@ async def run_bot_instance(bot):
             await bot.start()
             logging.info(f"Bot with session_id: {bot.session_id} started successfully")
             return  # Exit the function if the bot starts successfully
+        except RuntimeError as e:
+            logging.error(f"Startup aborted for bot {bot.session_id}: {e}")
+            return
         except Exception as e:
             retry_count += 1
             logging.error(f"Error in bot {bot.session_id} on attempt {retry_count}: {e}")

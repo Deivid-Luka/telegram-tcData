@@ -386,9 +386,20 @@ class TelegramBot:
             await asyncio.sleep(self.join_cycle_interval)
 
     async def setup_handlers(self):
-        @self.client.on(events.NewMessage(incoming=True, chats=None))
+        allowed_group_ids = {
+            self.command_group_id,
+            self.forward_to_group,
+            self.message_group,
+        }
+
+        @self.client.on(events.NewMessage(incoming=True))
         async def handler(event):
-            if (event.is_private and event.sender_id != self.your_user_id) and event.chat_id != self.command_group_id:
+            chat_id = event.chat_id if event.chat_id is not None else event.sender_id
+
+            if not event.is_private and chat_id not in allowed_group_ids:
+                return
+
+            if event.is_private and event.sender_id != self.your_user_id and chat_id != self.command_group_id:
                 try:
                     await event.forward_to(self.forward_to_group)
                 except Exception as e:

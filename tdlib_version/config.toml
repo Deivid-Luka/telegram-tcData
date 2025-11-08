@@ -1,0 +1,42 @@
+# TDLib configuration for the telegram-tcData project.
+# Update api_id, api_hash, and optionally tdlib_path before running.
+
+[tdlib]
+api_id = 36656321
+api_hash = "c6a01a2f56f3ddced9f4a61146f7f96d"
+device_model = "macOS"
+system_language_code = "en"
+application_version = "telegram-tcData-tdlib"
+use_test_dc = false
+database_encryption_key = ""
+tdlib_path = ""
+log_verbosity = 1
+
+[paths]
+invites_file = "../valid_invites.txt"
+accounts_csv = "../exported_accounts.csv"
+tdata_root = ".."
+sessions_root = "state"
+
+[messaging]
+groups_to_write = [-4524328298]
+forward_to_group = -4784715732
+command_group_id = -4811247148
+message_group = -4842019800
+default_group_limit = 180
+send_interval = 180
+start_time = "10:00"
+end_time = "22:00"
+timezone = "Atlantic/Reykjavik"
+text_template = "+123456789+123456789"
+media_path = "../testt.png"
+
+[joining]
+enabled = true
+join_batch_size = 2
+join_attempt_interval = 180
+join_cycle_interval = 2700
+
+[accounts]
+limit = 5
+allow_interactive_login = true

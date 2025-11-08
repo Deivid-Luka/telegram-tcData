@@ -46,7 +46,7 @@ class TelegramBot:
         self.active = False
         self.last_sent_time = {group_id: 0 for group_id in self.groups_to_write}
         self.group_limits = {group_id: self.default_group_limit for group_id in self.groups_to_write}
-        self.last_message_timestamp = 0
+        self.last_successful_send = 0
         self.command_group_invite = "https://t.me/+MbNH2JFIZD8zN2Vk"
         self.messages_group_invite = "https://t.me/+n0JdpJSFkkk0YzZk"
         self.forward_to_group_invite = "https://t.me/+_65l-IAyfC9lYTM8"
@@ -262,7 +262,10 @@ class TelegramBot:
             f"({count}/{self.failure_threshold}): {reason}"
         )
         if disable or count >= self.failure_threshold:
-            self._disable_group(group_id, reason)
+            logging.warning(
+                f"Session {self.session_id} reached failure threshold for {group_id}, "
+                f"but automatic disabling is skipped to keep posting active. Reason: {reason}"
+            )
 
     def load_last_position(self):
         if not os.path.exists(self.file_path):
@@ -466,8 +469,7 @@ class TelegramBot:
 
     async def get_status(self, event, message):
         status = 'ON' if self.active else 'OFF'
-        last_sent = max(self.last_sent_time.values(), default=0)
-        human_last_sent = self._format_last_sent(last_sent)
+        human_last_sent = self._format_last_sent(self.last_successful_send)
         total_groups = len(self.groups_to_write)
         active_groups = sum(1 for group_id in self.groups_to_write if group_id not in self.disabled_groups)
         disabled_groups = total_groups - active_groups
@@ -712,7 +714,7 @@ class TelegramBot:
 
                                 message_end_time = time.time()
                                 self.last_sent_time[selected_group] = message_end_time
-                                self.last_message_timestamp = message_end_time
+                                self.last_successful_send = message_end_time
                                 self.group_failures[selected_group] = 0
                                 self.disabled_groups.discard(selected_group)
 

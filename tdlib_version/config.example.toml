@@ -1,0 +1,43 @@
+# Copy this file to config.toml and update the secrets before running the TDLib workflow.
+
+[tdlib]
+api_id = 0
+api_hash = ""
+device_model = "macOS"
+system_language_code = "en"
+application_version = "telegram-tcData-tdlib"
+use_test_dc = false
+database_encryption_key = ""
+# Absolute path to libtdjson (optional when it is available on the default loader path)
+# tdlib_path = "/opt/homebrew/lib/libtdjson.dylib"
+log_verbosity = 1
+
+[paths]
+invites_file = "../valid_invites.txt"
+accounts_csv = "../exported_accounts.csv"
+tdata_root = ".."
+sessions_root = "state"
+
+[messaging]
+groups_to_write = [-4524328298]
+forward_to_group = -4784715732
+command_group_id = -4811247148
+message_group = -4842019800
+default_group_limit = 180
+send_interval = 180
+start_time = "10:00"
+end_time = "22:00"
+timezone = "Atlantic/Reykjavik"
+text_template = "+123456789+123456789"
+media_path = "../testt.png"
+
+[joining]
+enabled = true
+join_batch_size = 2
+join_attempt_interval = 180
+join_cycle_interval = 2700
+
+[accounts]
+# Limit the number of accounts to start per run (null => all)
+limit = null
+allow_interactive_login = true

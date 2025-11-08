@@ -23,6 +23,8 @@ from opentele.api import UseCurrentSession
 import random
 import asyncio
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse, parse_qs
+from typing import Tuple
 
 try:
     import fcntl
@@ -129,12 +131,61 @@ class TelegramBot:
         finally:
             self._release_session_lock()
 
+    @staticmethod
+    def _extract_invite_hash(invite: str) -> Tuple[str, str]:
+        invite = invite.strip()
+        if not invite:
+            raise ValueError("Empty invite link")
+
+        if invite.startswith("tg://"):
+            parsed = urlparse(invite)
+            query = parse_qs(parsed.query or "")
+            hash_part = query.get("invite", [""])[0]
+            if not hash_part:
+                raise ValueError("Invalid tg:// invite link")
+            return hash_part, hash_part
+
+        parsed = urlparse(invite)
+        path = (parsed.path or "").lstrip("/")
+        segments = [segment for segment in path.split("/") if segment]
+        if not segments:
+            normalized = invite.lstrip("+")
+            return normalized or invite, invite
+
+        last_segment = segments[-1]
+        last_segment = last_segment.split("?", 1)[0].split("#", 1)[0]
+        normalized = last_segment.lstrip("+") or last_segment
+        return normalized, last_segment
+
     async def join_desired_group(self, message):
-        if "joinchat" in message or "+" in message:
-            hash_part = message.split('/')[-1].replace('+', '')
-            await self.client(ImportChatInviteRequest(hash_part))
+        link = message.strip()
+        lower_link = link.lower()
+        if "joinchat" in lower_link or "t.me/+" in lower_link or link.startswith("tg://"):
+            hash_part, raw_hash = self._extract_invite_hash(link)
+            try:
+                await self.client(ImportChatInviteRequest(hash_part))
+            except (InviteHashExpiredError, InviteHashInvalidError):
+                if raw_hash != hash_part:
+                    await self.client(ImportChatInviteRequest(raw_hash))
+                else:
+                    raise
+        elif link.startswith("https://t.me/") and "+" in link:
+            hash_part, raw_hash = self._extract_invite_hash(link)
+            try:
+                await self.client(ImportChatInviteRequest(hash_part))
+            except (InviteHashExpiredError, InviteHashInvalidError):
+                if raw_hash != hash_part:
+                    await self.client(ImportChatInviteRequest(raw_hash))
+                else:
+                    raise
         else:
-            await self.client(JoinChannelRequest(message))
+            parsed = urlparse(link)
+            entity = link
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                path = (parsed.path or "").strip("/")
+                if path:
+                    entity = path.split("/", 1)[0]
+            await self.client(JoinChannelRequest(entity))
 
     @staticmethod
     def _join_error_message(error):

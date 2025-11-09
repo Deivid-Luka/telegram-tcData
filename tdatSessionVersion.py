@@ -53,7 +53,7 @@ class TelegramBot:
         self.messages_group_invite = "https://t.me/+n0JdpJSFkkk0YzZk"
         self.forward_to_group_invite = "https://t.me/+_65l-IAyfC9lYTM8"
         self.start_time = "10:00"
-        self.end_time = "22:00"
+        self.end_time = "23:00"
         self.timezone = ZoneInfo("Atlantic/Reykjavik")
         self.file_path = os.path.join(directory, f"{session_id}_progress.log")
         self.invite_links = invite_links
@@ -313,10 +313,7 @@ class TelegramBot:
             f"({count}/{self.failure_threshold}): {reason}"
         )
         if disable or count >= self.failure_threshold:
-            logging.warning(
-                f"Session {self.session_id} reached failure threshold for {group_id}, "
-                f"but automatic disabling is skipped to keep posting active. Reason: {reason}"
-            )
+            self._disable_group(group_id, reason)
 
     def load_last_position(self):
         if not os.path.exists(self.file_path):

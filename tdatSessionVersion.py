@@ -38,7 +38,7 @@ class TelegramBot:
         self.phone_number = phone_number
         self.session_id = session_id
         self.session_file = f'session_{session_id}'
-        self.groups_to_write = [-4524328298]
+        self.groups_to_write = []
         self.default_group_limit = 180
         self.your_user_id = '@togoshpk'
         self.command_group_id = -4811247148
@@ -77,6 +77,8 @@ class TelegramBot:
         os.makedirs(self.lock_dir, exist_ok=True)
         self.lock_path = os.path.join(self.lock_dir, f"{self.session_id}.lock")
         self.lock_handle = None
+        self.group_refresh_task = None
+        self.group_refresh_lock = None
 
     async def ensure_command_group_membership(self, invite_link=None, group_type='command'):
         logging.info(f"Bot {self.session_id} attempting to join the {group_type} group...")
@@ -105,6 +107,7 @@ class TelegramBot:
             await self.ensure_command_group_membership(self.forward_to_group_invite, group_type='forward')
 
             await self.setup_handlers()
+            await self.refresh_groups_from_dialogs(reset=True)
 
             self.background_tasks = [
                 asyncio.create_task(self.send_message_loop(), name=f"send-loop-{self.session_id}")
@@ -295,9 +298,23 @@ class TelegramBot:
         self.disabled_groups.add(group_id)
         self.group_limits[group_id] = float('inf')
         self.last_sent_time[group_id] = time.time()
+        if group_id in self.groups_to_write:
+            self.groups_to_write = [gid for gid in self.groups_to_write if gid != group_id]
         logging.warning(
             f"Session {self.session_id} disabled group {group_id} due to repeated failures: {reason}"
         )
+        if not self.groups_to_write:
+            self._schedule_group_refresh()
+
+    def _schedule_group_refresh(self):
+        if self.group_refresh_task and not self.group_refresh_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self.group_refresh_task = loop.create_task(self.refresh_groups_from_dialogs(reset=True))
+        self.group_refresh_task.add_done_callback(lambda _: setattr(self, "group_refresh_task", None))
 
     def _mark_group_failure(self, group_id, reason, disable=False):
         if group_id is None:
@@ -631,38 +648,85 @@ class TelegramBot:
             await event.respond(f"Error retrieving groups: {e}")
 
     async def populate_groups(self, event, message):
-        if len(message) > 1 and int(message[1]) == self.session_id:
-            await self._populate_groups(event)
+        if len(message) > 1:
+            try:
+                target_session = int(message[1])
+            except ValueError:
+                await event.respond("Usage: /populate-groups <session_id>")
+                return
+            if target_session == self.session_id:
+                await self._populate_groups(event, reset=True)
 
     async def populate_groups_all(self, event, message):
-        await self._populate_groups(event)
+        await self._populate_groups(event, reset=True)
 
-    async def _populate_groups(self, event):
-        try:
-            result = await self.client(GetDialogsRequest(
-                offset_date=None,
-                offset_id=0,
-                offset_peer=InputPeerEmpty(),
-                limit=200,
-                hash=0
-            ))
-            chats = result.chats
+    async def refresh_groups_from_dialogs(self, reset=False):
+        if self.group_refresh_lock is None:
+            self.group_refresh_lock = asyncio.Lock()
+        async with self.group_refresh_lock:
+            try:
+                result = await self.client(GetDialogsRequest(
+                    offset_date=None,
+                    offset_id=0,
+                    offset_peer=InputPeerEmpty(),
+                    limit=200,
+                    hash=0
+                ))
+            except Exception as e:
+                logging.error(f"Session {self.session_id} failed to refresh groups: {e}")
+                return []
+
+            excluded_ids = {
+                abs(self.command_group_id),
+                abs(self.forward_to_group),
+                abs(self.message_group),
+            }
+            if reset:
+                self.groups_to_write = []
+                existing_ids = set()
+            else:
+                existing_ids = set(self.groups_to_write)
+
             new_groups = []
-            response = "Joined groups:\n"
-            for chat in chats:
-                if isinstance(chat, (Chat, Channel)) and abs(chat.id) not in {abs(self.command_group_id),
-                                                                              abs(self.forward_to_group),
-                                                                              abs(self.message_group)}:
-                    new_groups.append(chat.id)
-                    self.group_limits.setdefault(chat.id, self.default_group_limit)
-                    self.last_sent_time.setdefault(chat.id, 0)
-                    self.group_failures.setdefault(chat.id, 0)
-                    self.disabled_groups.discard(chat.id)
-                    response += f"{chat.id}: {chat.title}\n"
-            self.groups_to_write.extend(new_groups)
-            await event.respond(f"Groups to write updated with {len(new_groups)} new groups.")
+            for chat in result.chats:
+                if not isinstance(chat, (Chat, Channel)):
+                    continue
+                chat_id = chat.id
+                if abs(chat_id) in excluded_ids:
+                    continue
+                if chat_id not in existing_ids:
+                    self.groups_to_write.append(chat_id)
+                    existing_ids.add(chat_id)
+                    title = getattr(chat, 'title', None) or getattr(chat, 'username', '') or "Untitled"
+                    new_groups.append((chat_id, title))
+                self.group_limits.setdefault(chat_id, self.default_group_limit)
+                self.last_sent_time.setdefault(chat_id, 0)
+                self.group_failures.setdefault(chat_id, 0)
+                self.disabled_groups.discard(chat_id)
+
+            logging.info(
+                f"Session {self.session_id} now tracking {len(self.groups_to_write)} writable groups "
+                f"(added {len(new_groups)})"
+            )
+            return new_groups
+
+    async def _populate_groups(self, event, reset=False):
+        try:
+            new_groups = await self.refresh_groups_from_dialogs(reset=reset)
         except Exception as e:
-            await event.respond(f"Error retrieving groups: {e}")
+            await event.respond(f"Error refreshing groups: {e}")
+            return
+
+        if new_groups:
+            details = "\n".join(f"{chat_id}: {title}" for chat_id, title in new_groups)
+            message = (
+                f"Added {len(new_groups)} new groups for session {self.session_id}:\n{details}"
+            )
+        else:
+            message = (
+                f"No new groups discovered. Still tracking {len(self.groups_to_write)} groups."
+            )
+        await self.send_long_message(event.chat_id, message)
 
     async def get_total_message_count(self, group_id):
         messages = await self.client.get_messages(group_id, limit=1)
